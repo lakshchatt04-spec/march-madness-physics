@@ -1,0 +1,10 @@
+# Normalise to LF in the repo and on checkout.  Without this, core.autocrlf
+# rewrites LF to CRLF the next time git touches a file, which produces
+# byte-level divergence between working copies that is pure noise.
+* text=auto eol=lf
+
+*.py text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.csv text eol=lf
+*.json text eol=lf

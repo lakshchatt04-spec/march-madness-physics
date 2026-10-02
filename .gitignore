@@ -1,0 +1,18 @@
+# Kaggle competition data - large, re-downloadable, not source
+march-machine-learning-mania-2026/
+data/
+.ncaa_cache/
+
+# Tool output
+fetch.log
+fetch.err.log
+.pytest_report.xml
+
+# Python / tooling caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
