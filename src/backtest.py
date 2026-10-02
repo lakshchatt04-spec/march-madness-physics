@@ -23,10 +23,25 @@ import pandas as pd
 from src.bracket import TournamentBracket
 from src.simulate import SimulationResult
 
-# Guard against a simulated probability of exactly zero, which would make the
-# title log loss infinite.  1e-12 is far below any probability a 10k-sim
-# bracket produces, so it only clamps the pathological tail.
+# Guard against a simulated probability of exactly zero, which would make a log
+# loss infinite.  1e-12 is far below any probability a 10k-sim bracket produces,
+# so it only clamps the pathological tail.
 _MIN_PROB = 1e-12
+
+#: Title log loss of a forecaster spreading its mass uniformly over a 68-team
+#: field.  Round to 2dp, and reported next to the model's score so the headline
+#: number always has a scale attached.
+UNIFORM_TITLE_LOG_LOSS = math.log(68)
+
+#: Mean squared error of a forecaster predicting the observed base rate.  Every
+#: tournament game has one winner and one loser, so the per-team advancement
+#: base rate is exactly 0.5 in every round and predicting 0.5 always scores
+#: exactly this.  An advancement Brier at or above it is worth nothing, however
+#: good it looks in isolation.
+TRIVIAL_ADVANCEMENT_BRIER = 0.25
+
+#: Mean ``-log p`` of a forecaster assigning 0.5 to every game's winner.
+TRIVIAL_WIN_LOG_LOSS = -math.log(0.5)
 
 
 class IncompleteTournamentError(ValueError):
@@ -230,6 +245,129 @@ def reach_brier(result: SimulationResult, outcome: ActualOutcome) -> float:
             total += (p - (1.0 if team in field else 0.0)) ** 2
             count += 1
     return total / count if count else float("nan")
+
+
+def win_log_loss_by_round(
+    result: SimulationResult, outcome: ActualOutcome
+) -> dict[int, tuple[float, int]]:
+    """Per-round ``(mean, n_games)`` breakdown of :func:`win_log_loss`.
+
+    Splitting by round is what makes the score interpretable.  The model can be
+    genuinely informative early - it ranks a 15% team above a 5% team and wins
+    - while being badly over-confident late, where it has too few games to tell
+    and its probabilities are much more spread out.  A pooled mean hides that
+    completely.
+    """
+    out: dict[int, tuple[float, int]] = {}
+    for round_no in outcome.round_teams:
+        probs = result.round_win_probabilities(round_no)
+        total = 0.0
+        count = 0
+        for team in outcome.advancers(round_no):
+            total -= math.log(max(probs.get(team, 0.0), _MIN_PROB))
+            count += 1
+        if count:
+            out[round_no] = (total / count, count)
+    return out
+
+
+def win_log_loss(
+    result: SimulationResult, outcome: ActualOutcome
+) -> tuple[float, int]:
+    """Mean ``-log p`` the model assigned to the team that actually won.
+
+    One observation per *game* rather than per team, and keyed off
+    :func:`ActualOutcome.advancers`, so it has a non-degenerate baseline: since
+    every game has a winner, predicting 0.5 for each scores
+    :data:`TRIVIAL_WIN_LOG_LOSS`.  That is what
+    :func:`advancement_brier` cannot offer, because its base rate is pinned at
+    0.5 by the bracket structure and it rewards a model for declining to
+    discriminate.
+
+    Play-in games are not scored, because :class:`ActualOutcome` records rounds
+    from 1 upward and a First Four game leaves no trace once the field has been
+    reconstructed.  :func:`reach_brier` is what covers reaching the round of 64
+    in the first place.
+
+    Returns:
+        ``(mean, n_games)``, with ``n_games == 0`` if the outcome is empty.
+    """
+    per_round = win_log_loss_by_round(result, outcome)
+    if not per_round:
+        return float("nan"), 0
+    total = sum(mean * n for mean, n in per_round.values())
+    count = sum(n for _, n in per_round.values())
+    return total / count, count
+
+
+def favourite_forecasts(
+    result: SimulationResult, outcome: ActualOutcome
+) -> list[tuple[int, float, int]]:
+    """One calibrated forecast per game: ``(round, P(favourite wins), 1 if it did)``.
+
+    The reliability view that is *not* structurally degenerate.  Bucketing raw
+    win probabilities is misleading here, because the two teams in one game
+    always sum to 1: in a late round only 2n events exist and exactly n are
+    wins, so the aggregate observed rate is forced to 0.5 no matter how good
+    the model is, and a bucket that mixes lopsided underdogs with near-coin-flip
+    losers drifts toward 0.5 for purely structural reasons.  Restricting to the
+    favourite gives a forecast whose base rate is the model's own hit rate, so
+    "the model said 80%" can actually be checked against "the favourite won 80%
+    of the time".
+
+    Ties at exactly ``p == 0.5`` score as an underdog loss, which is the
+    convention :meth:`ActualOutcome.advancers` needs in order for
+    :func:`win_log_loss` to see every game's winner exactly once.
+    """
+    rows: list[tuple[int, float, int]] = []
+    for round_no in outcome.round_teams:
+        probs = result.round_win_probabilities(round_no)
+        for team in outcome.advancers(round_no):
+            p = probs.get(team, 0.0)
+            rows.append((round_no, max(p, 1.0 - p), 1 if p > 0.5 else 0))
+    return rows
+
+
+def reliability_forecasts(
+    result: SimulationResult, outcome: ActualOutcome
+) -> list[tuple[int, float, int]]:
+    """Per-team advancement events as ``(round, P(advance), 1 if advanced)``."""
+    rows: list[tuple[int, float, int]] = []
+    for round_no, field in outcome.round_teams.items():
+        probs = result.round_win_probabilities(round_no)
+        advanced = outcome.advancers(round_no)
+        for team in field:
+            rows.append((round_no, probs.get(team, 0.0), 1 if team in advanced else 0))
+    return rows
+
+
+def round_trivial_baselines(outcome: ActualOutcome) -> dict[int, dict[str, float]]:
+    """Best-possible constant prediction per round, for both Brier scores.
+
+    Neither Brier has a single global floor.  Predicting each round's own
+    observed base rate scores
+
+    * ``p * (1 - p)`` for advancement, where ``p`` is the share of that round's
+      field that advanced - and because a single-elimination round always splits
+      its field evenly, that is exactly 0.25 in every round; and
+    * ``p * (1 - p)`` again for reach, where ``p`` genuinely varies by round,
+      since a 68-team field puts 64 teams in round 1 but only 2 in the final.
+
+    Returns:
+        ``{round_no: {"adv": ..., "reach": ...}}``.  The ``reach`` baseline
+        scores the full ``bracket_teams`` field each round, matching
+        :func:`reach_brier`, which also enumerates the whole field every round.
+    """
+    baselines: dict[int, dict[str, float]] = {}
+    for round_no, field in outcome.round_teams.items():
+        adv_p = len(outcome.advancers(round_no)) / len(field) if field else 0.0
+        reach_p = len(field) / len(outcome.bracket_teams) if outcome.bracket_teams else 0.0
+        baselines[round_no] = {
+            "adv": adv_p * (1.0 - adv_p),
+            "reach": reach_p * (1.0 - reach_p),
+        }
+    return baselines
+
 
 # Buckets for the reliability diagram.  Wide at the extremes because a
 # well-behaved model puts almost nothing out there, and narrow through the
