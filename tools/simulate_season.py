@@ -18,7 +18,7 @@ from src.calibration import (  # noqa: E402
     build_particle_teams_from_fit,
     estimate_latent_fraction,
     fit_dyadic,
-    floored_team_fraction,
+    summarise_fit,
 )
 from src.data_loader import load_games, load_particle_teams, load_teams  # noqa: E402
 from src.simulate import simulate_bracket  # noqa: E402
@@ -75,20 +75,13 @@ def main(argv: list[str] | None = None) -> int:
     games = load_games(args.data, seasons=fit_seasons)
     teams = load_particle_teams(args.data, seasons=fit_seasons)
     names = load_teams(args.data)
-    if not args.quiet_fit:
-        print(f"fitted on seasons {fit_seasons}: {len(games)} games, "
-              f"{len(teams)} teams")
 
     fit = fit_dyadic(games, teams)
     phi = estimate_latent_fraction(games, teams, fit)
     if not args.quiet_fit:
-        v = fit.volatility
-        print(f"  converged={fit.converged} in {fit.iterations} iters")
-        print(f"  sigma_0={v.sigma_0:.3f} alpha={v.alpha:.3f} beta={v.beta:.3f}")
-        print(f"  home_advantage={fit.home_advantage_points:.3f} pts")
-        floored = floored_team_fraction(teams, fit)
-        if floored:
-            print(f"  volatility floor hit for {floored:.1%} of teams")
+        print(f"fitted on seasons {fit_seasons}")
+        for line in summarise_fit(fit, teams):
+            print(f"  {line}")
         note = "" if phi else "  (undetermined - needs ~12+ seasons per team)"
         print(f"  latent_fraction phi={phi:.3f} (persistent share of sigma^2){note}")
 
