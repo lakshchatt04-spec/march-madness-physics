@@ -208,6 +208,37 @@ def title_log_loss(result: SimulationResult, champion: int) -> float:
     return -math.log(max(p, _MIN_PROB))
 
 
+def conditional_win_probabilities(
+    result: SimulationResult, round_no: int
+) -> dict[int, float]:
+    """``P(wins round round_no | reached it)`` for every team that could.
+
+    :meth:`~src.simulate.SimulationResult.round_win_probabilities` is
+    *unconditional*: it folds in the risk of never reaching the round, so it
+    decays with depth - across a real backtest it runs about 0.69 in round 1
+    but 0.04 by the Final Four.  That is the right number to *publish*, because
+    at prediction time nobody knows the opponent yet.
+
+    It is the wrong number to score a per-game forecast with.  Scoring the
+    unconditional value marks a team down for a risk that has already been
+    resolved by the time the game is played, and the error compounds with depth
+    until a near-certain final is scored as if it were a 4% shot.  Measured
+    against the model's own analytic probability for the game that was actually
+    played, the unconditional value understates it by 1.0x in round 1 but 3.1x
+    by the Elite Eight and 10.9x by the Final Four.
+
+    Dividing by presence probability recovers the per-game forecast.  Teams with
+    zero presence probability are omitted rather than divided by.
+    """
+    appearances = result.appearance_probabilities(round_no)
+    out: dict[int, float] = {}
+    for team, p_win in result.round_win_probabilities(round_no).items():
+        p_present = appearances.get(team, 0.0)
+        if p_present > 0.0:
+            out[team] = p_win / p_present
+    return out
+
+
 def advancement_brier(result: SimulationResult, outcome: ActualOutcome) -> float:
     """Mean squared error over every (round, team) advancement event.
 
@@ -216,6 +247,11 @@ def advancement_brier(result: SimulationResult, outcome: ActualOutcome) -> float
     far more informative than a title-only score because it scores all 67 games
     instead of one, so a model that nails the champion but has no idea how the
     field narrows is still penalised appropriately.
+
+    The forecast is the *unconditional* advance probability, so this score
+    partly measures how well the model predicts who is still alive - which is
+    what :func:`reach_brier` isolates, and why the two are reported together.
+    To score the games themselves, use :func:`conditional_win_probabilities`.
     """
     total = 0.0
     count = 0
@@ -252,15 +288,14 @@ def win_log_loss_by_round(
 ) -> dict[int, tuple[float, int]]:
     """Per-round ``(mean, n_games)`` breakdown of :func:`win_log_loss`.
 
-    Splitting by round is what makes the score interpretable.  The model can be
-    genuinely informative early - it ranks a 15% team above a 5% team and wins
-    - while being badly over-confident late, where it has too few games to tell
-    and its probabilities are much more spread out.  A pooled mean hides that
-    completely.
+    Splitting by round is what makes the score interpretable, because a model
+    can be sharp early - it ranks a 15% team above a 5% team and wins - while
+    drifting in the late rounds, where each round has fewer games and the
+    bracket does more of the narrowing.  A pooled mean hides that completely.
     """
     out: dict[int, tuple[float, int]] = {}
     for round_no in outcome.round_teams:
-        probs = result.round_win_probabilities(round_no)
+        probs = conditional_win_probabilities(result, round_no)
         total = 0.0
         count = 0
         for team in outcome.advancers(round_no):
@@ -283,6 +318,12 @@ def win_log_loss(
     :func:`advancement_brier` cannot offer, because its base rate is pinned at
     0.5 by the bracket structure and it rewards a model for declining to
     discriminate.
+
+    The probability scored is the per-game *conditional* from
+    :func:`conditional_win_probabilities`, not the unconditional advance
+    probability.  Scoring the latter scores a resolved risk as if it were still
+    open, which compounds with round depth and made the late rounds look like
+    total collapse when the model was merely drifting.
 
     Play-in games are not scored, because :class:`ActualOutcome` records rounds
     from 1 upward and a First Four game leaves no trace once the field has been
@@ -315,13 +356,17 @@ def favourite_forecasts(
     "the model said 80%" can actually be checked against "the favourite won 80%
     of the time".
 
+    Uses the same per-game conditional as :func:`win_log_loss`; see
+    :func:`conditional_win_probabilities` for why that distinction is not
+    optional.
+
     Ties at exactly ``p == 0.5`` score as an underdog loss, which is the
     convention :meth:`ActualOutcome.advancers` needs in order for
     :func:`win_log_loss` to see every game's winner exactly once.
     """
     rows: list[tuple[int, float, int]] = []
     for round_no in outcome.round_teams:
-        probs = result.round_win_probabilities(round_no)
+        probs = conditional_win_probabilities(result, round_no)
         for team in outcome.advancers(round_no):
             p = probs.get(team, 0.0)
             rows.append((round_no, max(p, 1.0 - p), 1 if p > 0.5 else 0))

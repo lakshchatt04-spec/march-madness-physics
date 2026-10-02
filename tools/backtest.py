@@ -343,6 +343,12 @@ def main(argv: list[str] | None = None) -> int:
         "  favourite:   observed near 'predicted' is real calibration, since "
         "the base rate here is the model's own hit rate, not a fixed 0.5"
     )
+    print(
+        "  note:        win log loss and the favourite tables score the "
+        "per-game conditional P(win | reached the round).  The advancement "
+        "tables score the unconditional P(advance past round r), which folds in "
+        "the risk of not getting there and so shrinks with depth."
+    )
     return 0
 
 

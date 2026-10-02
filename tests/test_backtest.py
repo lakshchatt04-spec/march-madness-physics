@@ -23,6 +23,7 @@ from src.backtest import (
     actual_outcome,
     advancement_brier,
     brier,
+    conditional_win_probabilities,
     favourite_forecasts,
     reach_brier,
     reliability_forecasts,
@@ -421,7 +422,12 @@ def _outcome(playin: TournamentBracket) -> ActualOutcome:
 
 
 def _confident_result(outcome: ActualOutcome, wins: int, n_sims: int) -> SimulationResult:
-    """Every team wins its round with probability ``wins / n_sims``."""
+    """Every team wins its round with probability ``wins / n_sims``.
+
+    Presence is certain, so the per-game conditional equals the unconditional
+    value and these fixtures exercise the win-log-loss path without the
+    dilution that :func:`conditional_win_probabilities` exists to undo.
+    """
     return SimulationResult(
         season=outcome.season,
         n_sims=n_sims,
@@ -430,9 +436,92 @@ def _confident_result(outcome: ActualOutcome, wins: int, n_sims: int) -> Simulat
             r: dict.fromkeys(field, wins) for r, field in outcome.round_teams.items()
         },
         appearance_counts={
-            r: dict.fromkeys(outcome.bracket_teams, n_sims) for r in outcome.round_teams
+            r: dict.fromkeys(field, n_sims) for r, field in outcome.round_teams.items()
         },
     )
+
+
+def _diluted_result(outcome: ActualOutcome) -> SimulationResult:
+    """A genuine 50% per-game forecast, buried under an unconditional 25%.
+
+    One win in four sims with two appearances gives ``P(advance) = 0.25`` against
+    a per-game conditional of ``0.25 / 0.5 = 0.5``.  This is the shape of real
+    output, and scoring the 0.25 is exactly the mistake
+    :func:`conditional_win_probabilities` exists to undo.
+    """
+    return SimulationResult(
+        season=outcome.season,
+        n_sims=4,
+        champion_counts={outcome.champion: 4},
+        round_counts={
+            r: dict.fromkeys(field, 1) for r, field in outcome.round_teams.items()
+        },
+        appearance_counts={
+            r: dict.fromkeys(field, 2) for r, field in outcome.round_teams.items()
+        },
+    )
+
+
+class TestConditionalWinProbabilities:
+    def test_divides_out_presence(self, playin: TournamentBracket) -> None:
+        outcome = _outcome(playin)
+        result = _diluted_result(outcome)
+        for round_no in outcome.round_teams:
+            conditional = conditional_win_probabilities(result, round_no)
+            for team in conditional:
+                unconditional = result.round_win_probabilities(round_no)[team]
+                presence = result.appearance_probabilities(round_no)[team]
+                assert conditional[team] == pytest.approx(unconditional / presence)
+
+    def test_fixture_really_is_diluted(self, playin: TournamentBracket) -> None:
+        """Guards the fixture: 0.25 unconditional must not read as 0.25 here."""
+        outcome = _outcome(playin)
+        result = _diluted_result(outcome)
+        for probs in conditional_win_probabilities(result, 3).values():
+            assert probs == pytest.approx(0.5)
+        assert result.round_win_probabilities(3) != {}
+
+    def test_win_log_loss_uses_the_conditional_not_the_unconditional(
+        self, playin: TournamentBracket
+    ) -> None:
+        """The regression this helper exists to prevent.
+
+        Scoring the unconditional 0.25 would report ``-log(0.25) = 1.386`` for a
+        forecast that is in fact a fair 50/50 game.
+        """
+        outcome = _outcome(playin)
+        result = _diluted_result(outcome)
+        mean, _ = win_log_loss(result, outcome)
+        assert mean == pytest.approx(TRIVIAL_WIN_LOG_LOSS)
+        assert mean < -math.log(0.25)
+
+    def test_zero_presence_teams_are_omitted_not_divided_by(
+        self, playin: TournamentBracket
+    ) -> None:
+        outcome = _outcome(playin)
+        result = SimulationResult(
+            season=playin.season,
+            n_sims=2,
+            champion_counts={outcome.champion: 2},
+            round_counts={1: {1: 1}},
+            appearance_counts={1: {1: 0}},
+        )
+        assert conditional_win_probabilities(result, 1) == {}
+
+    def test_early_rounds_are_unaffected_by_dilution(
+        self, playin: TournamentBracket
+    ) -> None:
+        """With certain presence the conditional *is* the unconditional value.
+
+        Round 1 presence is near 1 in real output, which is why the dilution
+        only becomes visible deeper in - 1.0x in round 1, 3.1x by the Elite
+        Eight, 10.9x by the Final Four.
+        """
+        outcome = _outcome(playin)
+        result = _confident_result(outcome, 1, 2)
+        for round_no in outcome.round_teams:
+            for team, p in conditional_win_probabilities(result, round_no).items():
+                assert p == pytest.approx(result.round_win_probabilities(round_no)[team])
 
 
 def _scored_games(outcome: ActualOutcome) -> int:
