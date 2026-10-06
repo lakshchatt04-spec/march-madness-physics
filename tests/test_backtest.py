@@ -23,8 +23,8 @@ from src.backtest import (
     actual_outcome,
     advancement_brier,
     brier,
-    conditional_win_probabilities,
     favourite_forecasts,
+    game_win_probabilities,
     reach_brier,
     reliability_forecasts,
     round_trivial_baselines,
@@ -151,7 +151,17 @@ def _make_winners(bracket: TournamentBracket) -> dict[str, int]:
     return out
 
 
-def _played_games(bracket: TournamentBracket, winners: dict[str, int]) -> pd.DataFrame:
+def _played_games(
+    bracket: TournamentBracket,
+    winners: dict[str, int],
+    locations: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """Game log for a resolved bracket; ``locations`` maps slot -> ``WLoc``.
+
+    ``WLoc`` is written from the *winner's* perspective, matching the real
+    file.  An omitted location means neutral.
+    """
+    locs = locations or {}
     team = dict(bracket.seeds)
     rows = []
     for day, slot in enumerate(_ordered_slots(bracket), start=130):
@@ -160,7 +170,8 @@ def _played_games(bracket: TournamentBracket, winners: dict[str, int]) -> pd.Dat
         win = winners[slot]
         lose = tb if win == ta else ta
         rows.append({"Season": bracket.season, "DayNum": day,
-                     "WTeamID": win, "LTeamID": lose})
+                     "WTeamID": win, "LTeamID": lose,
+                     "WLoc": locs.get(slot, "N")})
         team[slot] = win
     return pd.DataFrame(rows)
 
@@ -441,87 +452,91 @@ def _confident_result(outcome: ActualOutcome, wins: int, n_sims: int) -> Simulat
     )
 
 
-def _diluted_result(outcome: ActualOutcome) -> SimulationResult:
-    """A genuine 50% per-game forecast, buried under an unconditional 25%.
-
-    One win in four sims with two appearances gives ``P(advance) = 0.25`` against
-    a per-game conditional of ``0.25 / 0.5 = 0.5``.  This is the shape of real
-    output, and scoring the 0.25 is exactly the mistake
-    :func:`conditional_win_probabilities` exists to undo.
-    """
-    return SimulationResult(
-        season=outcome.season,
-        n_sims=4,
-        champion_counts={outcome.champion: 4},
-        round_counts={
-            r: dict.fromkeys(field, 1) for r, field in outcome.round_teams.items()
-        },
-        appearance_counts={
-            r: dict.fromkeys(field, 2) for r, field in outcome.round_teams.items()
-        },
+def _team_average(result: SimulationResult, round_no: int, team: int) -> float:
+    """The old per-team per-game forecast: unconditional advance / presence."""
+    return (
+        result.round_win_probabilities(round_no)[team]
+        / result.appearance_probabilities(round_no)[team]
     )
 
 
-class TestConditionalWinProbabilities:
-    def test_divides_out_presence(self, playin: TournamentBracket) -> None:
-        outcome = _outcome(playin)
-        result = _diluted_result(outcome)
-        for round_no in outcome.round_teams:
-            conditional = conditional_win_probabilities(result, round_no)
-            for team in conditional:
-                unconditional = result.round_win_probabilities(round_no)[team]
-                presence = result.appearance_probabilities(round_no)[team]
-                assert conditional[team] == pytest.approx(unconditional / presence)
-
-    def test_fixture_really_is_diluted(self, playin: TournamentBracket) -> None:
-        """Guards the fixture: 0.25 unconditional must not read as 0.25 here."""
-        outcome = _outcome(playin)
-        result = _diluted_result(outcome)
-        for probs in conditional_win_probabilities(result, 3).values():
-            assert probs == pytest.approx(0.5)
-        assert result.round_win_probabilities(3) != {}
-
-    def test_win_log_loss_uses_the_conditional_not_the_unconditional(
+class TestPerTeamAveragesAreNotPerGameForecasts:
+    def test_two_teams_in_one_game_need_not_sum_to_one(
         self, playin: TournamentBracket
     ) -> None:
-        """The regression this helper exists to prevent.
+        """The defect: a marginal is not a distribution over outcomes.
 
-        Scoring the unconditional 0.25 would report ``-log(0.25) = 1.386`` for a
-        forecast that is in fact a fair 50/50 game.
+        The two teams are averaged over *different* opponent draws, so their
+        numbers are two separate forecasts that never complement each other.
+        Across a real 20-season backtest this failed in 679 of 1260 games.
         """
         outcome = _outcome(playin)
-        result = _diluted_result(outcome)
-        mean, _ = win_log_loss(result, outcome)
-        assert mean == pytest.approx(TRIVIAL_WIN_LOG_LOSS)
-        assert mean < -math.log(0.25)
+        _, result = _simulated_field(playin, outcome, elo_step=25.0, n_sims=3000)
+        for round_no in outcome.round_teams:
+            pairs = [
+                _team_average(result, round_no, team_a)
+                + _team_average(result, round_no, team_b)
+                for team_a, team_b in _games_of(outcome, round_no)
+            ]
+            # Round 1 has a single possible opponent, so it is coherent.  Every
+            # later round mixes opponents and the two numbers drift apart.
+            expected = 0 if round_no == 1 else len(pairs)
+            assert sum(abs(pair - 1.0) > 1e-9 for pair in pairs) >= expected
 
-    def test_zero_presence_teams_are_omitted_not_divided_by(
+    def test_the_per_team_average_is_not_the_actual_pairing(
         self, playin: TournamentBracket
     ) -> None:
+        """A different quantity, not merely a noisy copy of the right one.
+
+        Round 1 happens to be coherent because a team faces one opponent.  From
+        round 2 on the average is spread over the whole field, so it drifts away
+        from the probability of the game that actually happened.
+        """
         outcome = _outcome(playin)
-        result = SimulationResult(
-            season=playin.season,
-            n_sims=2,
-            champion_counts={outcome.champion: 2},
-            round_counts={1: {1: 1}},
-            appearance_counts={1: {1: 0}},
+        params = _params(volatility=VolatilityParams(30.0, 0.0, 0.0))
+        field, result = _simulated_field(playin, outcome, elo_step=25.0, n_sims=3000)
+        analytic = game_win_probabilities(outcome, field, params)
+        gaps = [
+            abs(_team_average(result, game.round_no, game.winner) - p_win)
+            for game, (_, p_win, _) in zip(outcome.games, analytic, strict=True)
+        ]
+        assert max(gaps) > 0.05
+        assert max(gaps[32:]) > max(gaps[:32])
+
+    def test_analytic_pair_is_exhaustive(
+        self, playin: TournamentBracket, playin_field: dict
+    ) -> None:
+        """The replacement really is a two-outcome distribution."""
+        outcome = _outcome(playin)
+        for _, p_win, p_lose in game_win_probabilities(outcome, playin_field, _params()):
+            assert p_win + p_lose == pytest.approx(1.0)
+
+    def test_per_game_score_ignores_the_simulation_entirely(
+        self, playin: TournamentBracket, playin_field: dict
+    ) -> None:
+        """A flat field and a sharp one must score differently.
+
+        The score is a property of the matchup model, so team strengths alone
+        drive it; no :class:`SimulationResult` is involved.
+        """
+        outcome = _outcome(playin)
+        mean_flat, n_flat = win_log_loss(outcome, _flat_field(outcome), _params())
+        mean_aligned, n_aligned = win_log_loss(
+            outcome, _aligned_field(outcome), _params()
         )
-        assert conditional_win_probabilities(result, 1) == {}
+        assert n_flat == n_aligned == _scored_games(outcome)
+        assert mean_flat == pytest.approx(TRIVIAL_WIN_LOG_LOSS)
+        assert mean_aligned < mean_flat
 
-    def test_early_rounds_are_unaffected_by_dilution(
-        self, playin: TournamentBracket
+    def test_missing_team_state_is_rejected_not_skipped(
+        self, playin: TournamentBracket, playin_field: dict
     ) -> None:
-        """With certain presence the conditional *is* the unconditional value.
-
-        Round 1 presence is near 1 in real output, which is why the dilution
-        only becomes visible deeper in - 1.0x in round 1, 3.1x by the Elite
-        Eight, 10.9x by the Final Four.
-        """
+        """A silently shortened sample would flatter the score."""
         outcome = _outcome(playin)
-        result = _confident_result(outcome, 1, 2)
-        for round_no in outcome.round_teams:
-            for team, p in conditional_win_probabilities(result, round_no).items():
-                assert p == pytest.approx(result.round_win_probabilities(round_no)[team])
+        broken = dict(playin_field)
+        broken.pop(outcome.games[0].team_a)
+        with pytest.raises(ValueError, match="no team state"):
+            game_win_probabilities(outcome, broken, _params())
 
 
 def _scored_games(outcome: ActualOutcome) -> int:
@@ -529,14 +544,55 @@ def _scored_games(outcome: ActualOutcome) -> int:
     return sum(len(f) // 2 for f in outcome.round_teams.values())
 
 
-class TestPerGameWinLogLoss:
-    """One observation per game, so the trivial baseline is well defined."""
+def _games_of(outcome: ActualOutcome, round_no: int) -> list[tuple[int, int]]:
+    """The actual pairings in one round, in bracket resolution order."""
+    return [(g.team_a, g.team_b) for g in outcome.games if g.round_no == round_no]
 
-    def test_coin_flip_scores_exactly_the_trivial_baseline(
+
+def _step_field(outcome: ActualOutcome, step: float) -> dict[int, ParticleTeam]:
+    """A hierarchy ordered by TeamID, spaced ``step`` Elo apart.
+
+    ``_make_winners`` resolves every slot to the higher team id, so ordering
+    Elo the same way makes the actual winners the favourites.  A larger step
+    means a sharper field and a more confident forecast.
+    """
+    low = min(outcome.bracket_teams)
+    return {tid: _team(tid, 1000.0 + step * (tid - low))
+            for tid in outcome.bracket_teams}
+
+
+def _aligned_field(outcome: ActualOutcome) -> dict[int, ParticleTeam]:
+    return _step_field(outcome, 50.0)
+
+
+def _flat_field(outcome: ActualOutcome) -> dict[int, ParticleTeam]:
+    """Every team identical: the matchup model has nothing to go on."""
+    return {tid: _team(tid, 1500.0) for tid in outcome.bracket_teams}
+
+
+def _simulated_field(
+    playin: TournamentBracket, outcome: ActualOutcome, elo_step: float, n_sims: int
+):
+    """A sharp field plus the bracket simulation run against it."""
+    field = _step_field(outcome, elo_step)
+    params = _params(volatility=VolatilityParams(30.0, 0.0, 0.0))
+    result = simulate_bracket(playin, field, params, n_sims=n_sims, seed=11)
+    return field, result
+
+
+class TestPerGameWinLogLoss:
+    """One observation per game, so the trivial baseline is well defined.
+
+    Scored off the analytic matchup, so a flat field is the coin flip and a
+    field aligned with the actual winners beats it.
+    """
+
+    def test_a_flat_field_scores_exactly_the_trivial_baseline(
         self, playin: TournamentBracket
     ) -> None:
         outcome = _outcome(playin)
-        mean, n_games = win_log_loss(_coin_flip_result(outcome), outcome)
+        flat = _flat_field(outcome)
+        mean, n_games = win_log_loss(outcome, flat, _params())
         assert mean == pytest.approx(TRIVIAL_WIN_LOG_LOSS)
         # One event per game.  A 68-team field plays 67 games, but the four
         # First Four games leave no trace in round_teams, so 63 are scored.
@@ -555,41 +611,35 @@ class TestPerGameWinLogLoss:
         self, playin: TournamentBracket
     ) -> None:
         outcome = _outcome(playin)
-        # Every actual winner gets p = 0.75, so the mean loss is -log(0.75).
-        mean, _ = win_log_loss(_confident_result(outcome, 3, 4), outcome)
-        assert mean == pytest.approx(-math.log(0.75))
+        mean, _ = win_log_loss(outcome, _aligned_field(outcome), _params())
         assert mean < TRIVIAL_WIN_LOG_LOSS
+        # The metric has a gradient, not a single cliff at 0.5: a weaker
+        # separation lands between the coin flip and the confident forecast.
+        mean_weak, _ = win_log_loss(outcome, _step_field(outcome, 4.0), _params())
+        assert TRIVIAL_WIN_LOG_LOSS > mean_weak > mean
 
-    def test_a_perfect_forecast_scores_zero(self, playin: TournamentBracket) -> None:
-        outcome = _outcome(playin)
-        assert win_log_loss(_confident_result(outcome, 1, 1), outcome) == pytest.approx(
-            (0.0, _scored_games(outcome))
-        )
-
-    def test_zero_probability_is_clamped_rather_than_infinite(
+    def test_the_score_is_always_finite_and_in_range(
         self, playin: TournamentBracket
     ) -> None:
+        """An absurd separation must still produce a finite mean."""
         outcome = _outcome(playin)
-        blind = SimulationResult(
-            season=playin.season,
-            n_sims=1,
-            champion_counts={outcome.champion: 1},
-            round_counts={},
-            appearance_counts={},
-        )
-        mean, n_games = win_log_loss(blind, outcome)
+        silly = {tid: _team(tid, 1500.0 + 5000.0 * tid)
+                 for tid in outcome.bracket_teams}
+        mean, n_games = win_log_loss(outcome, silly, _params())
         assert math.isfinite(mean)
-        assert mean > TRIVIAL_WIN_LOG_LOSS
         assert n_games == _scored_games(outcome)
 
-    def test_empty_outcome_reports_nan_rather_than_dividing_by_zero(self) -> None:
+    def test_empty_outcome_reports_nan_rather_than_dividing_by_zero(
+        self, playin: TournamentBracket
+    ) -> None:
         empty = ActualOutcome(
             season=2025,
             champion=1,
             round_teams={},
             bracket_teams=frozenset({1}),
         )
-        mean, n_games = win_log_loss(_coin_flip_result(empty), empty)
+        flat = _flat_field(empty)
+        mean, n_games = win_log_loss(empty, flat, _params())
         assert math.isnan(mean)
         assert n_games == 0
 
@@ -597,7 +647,8 @@ class TestPerGameWinLogLoss:
         self, playin: TournamentBracket
     ) -> None:
         outcome = _outcome(playin)
-        per_round = win_log_loss_by_round(_confident_result(outcome, 3, 4), outcome)
+        aligned = _aligned_field(outcome)
+        per_round = win_log_loss_by_round(outcome, aligned, _params())
         assert per_round
         for round_no, (_, count) in per_round.items():
             # Every scored round splits its field evenly, so half the games.
@@ -605,7 +656,7 @@ class TestPerGameWinLogLoss:
         weighted = sum(m * n for m, n in per_round.values()) / sum(
             n for _, n in per_round.values()
         )
-        pooled, pooled_n = win_log_loss(_confident_result(outcome, 3, 4), outcome)
+        pooled, pooled_n = win_log_loss(outcome, aligned, _params())
         assert pooled == pytest.approx(weighted)
         assert pooled_n == sum(n for _, n in per_round.values())
 
@@ -617,17 +668,19 @@ class TestFavouriteForecasts:
         self, playin: TournamentBracket
     ) -> None:
         outcome = _outcome(playin)
-        rows = favourite_forecasts(_confident_result(outcome, 3, 4), outcome)
+        aligned = _aligned_field(outcome)
+        rows = favourite_forecasts(outcome, aligned, _params())
         assert len(rows) == _scored_games(outcome)
-        assert min(p for _, p, _ in rows) == pytest.approx(0.75)
+        assert min(p for _, p, _ in rows) >= 0.5
 
     def test_observed_rate_is_the_models_hit_rate_not_a_fixed_half(
         self, playin: TournamentBracket
     ) -> None:
         """The point of the metric: the base rate is free to move."""
         outcome = _outcome(playin)
-        rows = favourite_forecasts(_confident_result(outcome, 3, 4), outcome)
-        # Every team is rated 0.75 and, by construction, every one advanced.
+        aligned = _aligned_field(outcome)
+        rows = favourite_forecasts(outcome, aligned, _params())
+        # The winners are the higher Elo, so the favourite should win every one.
         assert sum(y for _, _, y in rows) / len(rows) == pytest.approx(1.0)
 
     def test_a_coin_flip_is_scored_as_an_underdog_loss(
@@ -635,7 +688,8 @@ class TestFavouriteForecasts:
     ) -> None:
         """p == 0.5 resolves to underdog, so winners are counted exactly once."""
         outcome = _outcome(playin)
-        rows = favourite_forecasts(_coin_flip_result(outcome), outcome)
+        flat = _flat_field(outcome)
+        rows = favourite_forecasts(outcome, flat, _params())
         assert all(p == pytest.approx(0.5) for _, p, _ in rows)
         assert sum(y for _, _, y in rows) == 0
 

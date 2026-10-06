@@ -21,6 +21,8 @@ from dataclasses import dataclass
 import pandas as pd
 
 from src.bracket import TournamentBracket
+from src.matchup import MatchupParams, Venue, win_probability
+from src.models import ParticleTeam
 from src.simulate import SimulationResult
 
 # Guard against a simulated probability of exactly zero, which would make a log
@@ -55,6 +57,28 @@ class IncompleteTournamentError(ValueError):
 
 
 @dataclass(frozen=True)
+class ActualGame:
+    """One game that was actually played, with the matchup it was.
+
+    Attributes:
+        round_no: Round the game belonged to, with 1 as the first round.
+        team_a: One of the two teams.
+        team_b: The other team.
+        winner: Which of the two won.
+        venue: Where ``team_a`` played, from ``team_a``'s perspective.  Stored
+            this way round because the source log records location from the
+            *winner's* side, which is the wrong perspective for scoring the
+            loser.
+    """
+
+    round_no: int
+    team_a: int
+    team_b: int
+    winner: int
+    venue: Venue
+
+
+@dataclass(frozen=True)
 class ActualOutcome:
     """Ground truth for a single season's tournament.
 
@@ -67,12 +91,16 @@ class ActualOutcome:
             counts in ``appearance_counts``, so the two are comparable.
         bracket_teams: Every TeamID in the field, including play-in losers who
             never reached round 1.
+        games: Every round-``r`` game in the order the bracket resolved them.
+            Play-ins are excluded, because once the field is reconstructed they
+            leave no trace in ``round_teams``.
     """
 
     season: int
     champion: int
     round_teams: Mapping[int, frozenset[int]]
     bracket_teams: frozenset[int]
+    games: tuple[ActualGame, ...] = ()
 
     @property
     def n_rounds(self) -> int:
@@ -102,6 +130,20 @@ def _slot_round(slot: str) -> int | None:
     return int(slot[1])
 
 
+def _venue_from_perspective(loc: str, for_team_a: bool) -> Venue:
+    """Convert a ``WLoc`` cell into a :class:`Venue` for ``team_a``.
+
+    The source log records location from the winner's point of view, so when
+    the winner is ``team_b`` the venue has to be flipped before it describes
+    ``team_a``.  Anything unrecognised is treated as neutral, which is correct
+    for tournament games and is what a frame without a ``WLoc`` column means.
+    """
+    venue = {"H": Venue.HOME, "A": Venue.AWAY}.get(loc.strip().upper(), Venue.NEUTRAL)
+    if for_team_a or venue is Venue.NEUTRAL:
+        return venue
+    return Venue.AWAY if venue is Venue.HOME else Venue.HOME
+
+
 def actual_outcome(
     tourney_games: pd.DataFrame, bracket: TournamentBracket
 ) -> ActualOutcome:
@@ -114,11 +156,13 @@ def actual_outcome(
     winners.
 
     Args:
-        tourney_games: Long frame of that season's tournament games.
+        tourney_games: Long frame of that season's tournament games.  A
+            ``WLoc`` column is used for the venue when present and assumed
+            neutral when absent.
         bracket: The bracket used for the simulation.
 
     Returns:
-        The season's actual champion and per-round field.
+        The season's actual champion, per-round field, and the games played.
 
     Raises:
         IncompleteTournamentError: If the log has the wrong number of rows for
@@ -134,18 +178,23 @@ def actual_outcome(
             f"{expected}; cannot reconstruct ground truth"
         )
 
-    winners: dict[tuple[int, int], int] = {}
-    for win, lose in zip(
-        tourney_games["WTeamID"], tourney_games["LTeamID"], strict=True
+    columns = tourney_games.columns
+    winners: dict[tuple[int, int], tuple[int, str]] = {}
+    for win, lose, loc in zip(
+        tourney_games["WTeamID"],
+        tourney_games["LTeamID"],
+        tourney_games["WLoc"] if "WLoc" in columns else [""] * len(tourney_games),
+        strict=True,
     ):
         w_id, l_id = int(win), int(lose)
-        winners[(w_id, l_id)] = w_id
-        winners[(l_id, w_id)] = w_id
+        winners[(w_id, l_id)] = (w_id, str(loc))
+        winners[(l_id, w_id)] = (w_id, str(loc))
 
     slot_team: dict[str, int] = {
         label: int(tid) for label, tid in bracket.seeds.items()
     }
     round_teams: dict[int, set[int]] = {}
+    games: list[ActualGame] = []
 
     play_ins = [s for s in bracket.slots if _slot_round(s) is None]
     by_round: dict[int, list[str]] = {}
@@ -171,11 +220,21 @@ def actual_outcome(
                 f"no tournament game between teams {team_a} and {team_b}, "
                 f"needed for slot {slot!r} in season {bracket.season}"
             )
-        slot_team[slot] = winners[key]
+        winner, loc = winners[key]
+        slot_team[slot] = winner
 
         round_no = _slot_round(slot)
         if round_no is not None:
             round_teams.setdefault(round_no, set()).update((team_a, team_b))
+            games.append(
+                ActualGame(
+                    round_no=round_no,
+                    team_a=team_a,
+                    team_b=team_b,
+                    winner=winner,
+                    venue=_venue_from_perspective(loc, winner == team_a),
+                )
+            )
 
     if not by_round:
         raise ValueError(f"bracket for season {bracket.season} has no game slots")
@@ -193,6 +252,7 @@ def actual_outcome(
         champion=champion,
         round_teams={r: frozenset(t) for r, t in round_teams.items()},
         bracket_teams=frozenset(bracket.seeds.values()),
+        games=tuple(games),
     )
 
 
@@ -208,35 +268,70 @@ def title_log_loss(result: SimulationResult, champion: int) -> float:
     return -math.log(max(p, _MIN_PROB))
 
 
-def conditional_win_probabilities(
-    result: SimulationResult, round_no: int
-) -> dict[int, float]:
-    """``P(wins round round_no | reached it)`` for every team that could.
+def _opposite_venue(venue: Venue) -> Venue:
+    if venue is Venue.HOME:
+        return Venue.AWAY
+    if venue is Venue.AWAY:
+        return Venue.HOME
+    return Venue.NEUTRAL
 
-    :meth:`~src.simulate.SimulationResult.round_win_probabilities` is
-    *unconditional*: it folds in the risk of never reaching the round, so it
-    decays with depth - across a real backtest it runs about 0.69 in round 1
-    but 0.04 by the Final Four.  That is the right number to *publish*, because
-    at prediction time nobody knows the opponent yet.
 
-    It is the wrong number to score a per-game forecast with.  Scoring the
-    unconditional value marks a team down for a risk that has already been
-    resolved by the time the game is played, and the error compounds with depth
-    until a near-certain final is scored as if it were a 4% shot.  Measured
-    against the model's own analytic probability for the game that was actually
-    played, the unconditional value understates it by 1.0x in round 1 but 3.1x
-    by the Elite Eight and 10.9x by the Final Four.
+def game_win_probabilities(
+    outcome: ActualOutcome,
+    teams: Mapping[int, ParticleTeam],
+    params: MatchupParams,
+) -> list[tuple[int, float, float]]:
+    """``(round_no, P(winner), P(loser))`` for every game actually played.
 
-    Dividing by presence probability recovers the per-game forecast.  Teams with
-    zero presence probability are omitted rather than divided by.
+    The forecast scored here is the model's analytic probability for *that*
+    matchup, ``Phi((Elo_a - Elo_b + hca) / tau_ab)``, at the venue the game was
+    played.  Both sides come from the same matchup and the same parameters, so
+    the pair sums to exactly 1.
+
+    That is the whole reason this function exists rather than a per-team
+    average.  :meth:`~src.simulate.SimulationResult.round_win_probabilities`
+    reports each team's win rate against *whatever opponent the simulation gave
+    it*, so the two teams in one game are averaged over different opponent draws
+    and their numbers need not sum to 1 - measured over a 20-season backtest
+    they failed to in 679 of 1260 games.  Scoring that marginal also measures
+    something the model never claimed: it is a win rate *per opponent drawn*,
+    not a probability of *this* game.  The analytic pair is what makes per-round
+    numbers comparable to each other, which is the entire point of splitting
+    them.
+
+    Args:
+        outcome: Ground truth, which carries the pairings and venues.
+        teams: Team states for the evaluated season, carrying the fitted Elo and
+            the volatility features that set ``tau``.
+        params: Matchup parameters for that season's fit.
+
+    Returns:
+        One ``(round_no, p_winner, p_loser)`` per scored game, in bracket
+        resolution order.  Play-ins are excluded, since
+        :attr:`ActualOutcome.games` starts at round 1.
+
+    Raises:
+        ValueError: If a team that actually played has no entry in ``teams``,
+            which would otherwise silently shrink the scored sample.
     """
-    appearances = result.appearance_probabilities(round_no)
-    out: dict[int, float] = {}
-    for team, p_win in result.round_win_probabilities(round_no).items():
-        p_present = appearances.get(team, 0.0)
-        if p_present > 0.0:
-            out[team] = p_win / p_present
-    return out
+    rows: list[tuple[int, float, float]] = []
+    for game in outcome.games:
+        team_a, team_b = teams.get(game.team_a), teams.get(game.team_b)
+        if team_a is None or team_b is None:
+            missing = game.team_a if team_a is None else game.team_b
+            raise ValueError(
+                f"team {missing} played in round {game.round_no} of season "
+                f"{outcome.season} but has no team state; cannot score the matchup"
+            )
+        p_a = win_probability(team_a, team_b, params=params, venue=game.venue)
+        p_b = win_probability(
+            team_b, team_a, params=params, venue=_opposite_venue(game.venue)
+        )
+        if game.winner == game.team_a:
+            rows.append((game.round_no, p_a, p_b))
+        else:
+            rows.append((game.round_no, p_b, p_a))
+    return rows
 
 
 def advancement_brier(result: SimulationResult, outcome: ActualOutcome) -> float:
@@ -251,7 +346,9 @@ def advancement_brier(result: SimulationResult, outcome: ActualOutcome) -> float
     The forecast is the *unconditional* advance probability, so this score
     partly measures how well the model predicts who is still alive - which is
     what :func:`reach_brier` isolates, and why the two are reported together.
-    To score the games themselves, use :func:`conditional_win_probabilities`.
+    It is not a per-game score: it folds in the risk of never reaching the
+    round, so it necessarily shrinks with depth.  To score the games themselves,
+    use :func:`game_win_probabilities`.
     """
     total = 0.0
     count = 0
@@ -284,7 +381,9 @@ def reach_brier(result: SimulationResult, outcome: ActualOutcome) -> float:
 
 
 def win_log_loss_by_round(
-    result: SimulationResult, outcome: ActualOutcome
+    outcome: ActualOutcome,
+    teams: Mapping[int, ParticleTeam],
+    params: MatchupParams,
 ) -> dict[int, tuple[float, int]]:
     """Per-round ``(mean, n_games)`` breakdown of :func:`win_log_loss`.
 
@@ -292,48 +391,47 @@ def win_log_loss_by_round(
     can be sharp early - it ranks a 15% team above a 5% team and wins - while
     drifting in the late rounds, where each round has fewer games and the
     bracket does more of the narrowing.  A pooled mean hides that completely.
+
+    It is only comparable across rounds because every round is scored with the
+    same analytic matchup forecast; see :func:`game_win_probabilities` for why
+    a per-team average would not be.
     """
     out: dict[int, tuple[float, int]] = {}
-    for round_no in outcome.round_teams:
-        probs = conditional_win_probabilities(result, round_no)
-        total = 0.0
-        count = 0
-        for team in outcome.advancers(round_no):
-            total -= math.log(max(probs.get(team, 0.0), _MIN_PROB))
-            count += 1
-        if count:
-            out[round_no] = (total / count, count)
-    return out
+    for round_no, p_win, _ in game_win_probabilities(outcome, teams, params):
+        total, count = out.get(round_no, (0.0, 0))
+        out[round_no] = (total - math.log(max(p_win, _MIN_PROB)), count + 1)
+    return {r: (total / count, count) for r, (total, count) in out.items() if count}
 
 
 def win_log_loss(
-    result: SimulationResult, outcome: ActualOutcome
+    outcome: ActualOutcome,
+    teams: Mapping[int, ParticleTeam],
+    params: MatchupParams,
 ) -> tuple[float, int]:
     """Mean ``-log p`` the model assigned to the team that actually won.
 
-    One observation per *game* rather than per team, and keyed off
-    :func:`ActualOutcome.advancers`, so it has a non-degenerate baseline: since
-    every game has a winner, predicting 0.5 for each scores
-    :data:`TRIVIAL_WIN_LOG_LOSS`.  That is what
-    :func:`advancement_brier` cannot offer, because its base rate is pinned at
-    0.5 by the bracket structure and it rewards a model for declining to
-    discriminate.
+    One observation per *game* rather than per team, so it has a non-degenerate
+    baseline: since every game has exactly one winner, predicting 0.5 for each
+    scores :data:`TRIVIAL_WIN_LOG_LOSS`.  That is what :func:`advancement_brier`
+    cannot offer, because its base rate is pinned at 0.5 by the bracket
+    structure and it rewards a model for declining to discriminate.
 
-    The probability scored is the per-game *conditional* from
-    :func:`conditional_win_probabilities`, not the unconditional advance
-    probability.  Scoring the latter scores a resolved risk as if it were still
-    open, which compounds with round depth and made the late rounds look like
-    total collapse when the model was merely drifting.
+    The probability scored is the analytic matchup forecast from
+    :func:`game_win_probabilities` - the model's probability for the game that
+    was actually played, not a per-team average over simulated opponents.
+    Averaging over simulated opponents compresses the deep rounds toward 0.5 for
+    a reason that has nothing to do with the forecast, which made the late
+    rounds look like a collapse when the model was merely overconfident.
 
-    Play-in games are not scored, because :class:`ActualOutcome` records rounds
-    from 1 upward and a First Four game leaves no trace once the field has been
+    Play-in games are not scored, because :attr:`ActualOutcome.games` starts at
+    round 1 and a First Four game leaves no trace once the field has been
     reconstructed.  :func:`reach_brier` is what covers reaching the round of 64
     in the first place.
 
     Returns:
         ``(mean, n_games)``, with ``n_games == 0`` if the outcome is empty.
     """
-    per_round = win_log_loss_by_round(result, outcome)
+    per_round = win_log_loss_by_round(outcome, teams, params)
     if not per_round:
         return float("nan"), 0
     total = sum(mean * n for mean, n in per_round.values())
@@ -342,34 +440,32 @@ def win_log_loss(
 
 
 def favourite_forecasts(
-    result: SimulationResult, outcome: ActualOutcome
+    outcome: ActualOutcome,
+    teams: Mapping[int, ParticleTeam],
+    params: MatchupParams,
 ) -> list[tuple[int, float, int]]:
     """One calibrated forecast per game: ``(round, P(favourite wins), 1 if it did)``.
 
-    The reliability view that is *not* structurally degenerate.  Bucketing raw
-    win probabilities is misleading here, because the two teams in one game
-    always sum to 1: in a late round only 2n events exist and exactly n are
-    wins, so the aggregate observed rate is forced to 0.5 no matter how good
-    the model is, and a bucket that mixes lopsided underdogs with near-coin-flip
-    losers drifts toward 0.5 for purely structural reasons.  Restricting to the
-    favourite gives a forecast whose base rate is the model's own hit rate, so
-    "the model said 80%" can actually be checked against "the favourite won 80%
-    of the time".
+    The reliability view that is *not* structurally degenerate.  Pooling raw win
+    probabilities is misleading, because in any round only ``2n`` events exist
+    and exactly ``n`` are wins, so the aggregate observed rate is forced to 0.5
+    no matter how good the model is, and a bucket that mixes lopsided underdogs
+    with near-coin-flip losers drifts toward 0.5 for purely structural reasons.
+    Restricting to the favourite gives a forecast whose base rate is the model's
+    own hit rate, so "the model said 80%" can actually be checked against "the
+    favourite won 80% of the time".
 
-    Uses the same per-game conditional as :func:`win_log_loss`; see
-    :func:`conditional_win_probabilities` for why that distinction is not
-    optional.
+    Scoring the analytic matchup pair also makes this table honest in a way the
+    old per-team average was not: because both sides come from one matchup they
+    sum to 1 exactly, so ``max(p_winner, p_loser)`` really is one team's
+    probability of winning the game that was played.
 
-    Ties at exactly ``p == 0.5`` score as an underdog loss, which is the
-    convention :meth:`ActualOutcome.advancers` needs in order for
-    :func:`win_log_loss` to see every game's winner exactly once.
+    Ties at exactly ``p == 0.5`` score as an underdog loss, so that
+    :func:`win_log_loss` sees every game's winner exactly once.
     """
     rows: list[tuple[int, float, int]] = []
-    for round_no in outcome.round_teams:
-        probs = conditional_win_probabilities(result, round_no)
-        for team in outcome.advancers(round_no):
-            p = probs.get(team, 0.0)
-            rows.append((round_no, max(p, 1.0 - p), 1 if p > 0.5 else 0))
+    for round_no, p_win, p_lose in game_win_probabilities(outcome, teams, params):
+        rows.append((round_no, max(p_win, p_lose), 1 if p_win > 0.5 else 0))
     return rows
 
 

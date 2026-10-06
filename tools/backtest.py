@@ -147,7 +147,7 @@ def evaluate_season(
     ranked = sorted(probs.items(), key=lambda kv: -kv[1])
     top = ranked[0] if ranked else (0, 0.0)
 
-    win_ll, n_games = win_log_loss(result, outcome)
+    win_ll, n_games = win_log_loss(outcome, sim_teams, matchup)
 
     metrics = {
         "season": float(season),
@@ -185,8 +185,8 @@ def evaluate_season(
         metrics,
         lines,
         reliability_forecasts(result, outcome),
-        favourite_forecasts(result, outcome),
-        win_log_loss_by_round(result, outcome),
+        favourite_forecasts(outcome, sim_teams, matchup),
+        win_log_loss_by_round(outcome, sim_teams, matchup),
     )
 
 
@@ -345,9 +345,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(
         "  note:        win log loss and the favourite tables score the "
-        "per-game conditional P(win | reached the round).  The advancement "
-        "tables score the unconditional P(advance past round r), which folds in "
-        "the risk of not getting there and so shrinks with depth."
+        "analytic probability for the matchup that was actually played, so "
+        "every round is on the same footing.  The advancement tables score the "
+        "unconditional P(advance past round r), which folds in the risk of not "
+        "getting there and so shrinks with depth - that is why their observed "
+        "rate is pinned near 50% and theirs is not."
     )
     return 0
 
